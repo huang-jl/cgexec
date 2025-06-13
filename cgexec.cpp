@@ -1,4 +1,5 @@
 #include <cerrno>
+#include <csignal>
 #include <cstdio>
 #include <fcntl.h>
 #include <iostream>
@@ -14,9 +15,19 @@
 
 #define CGROUP_PATH "/sys/fs/cgroup"
 
+pid_t child_pid = -1;
+
 // Wrapper for clone3 syscall
 static int clone3(struct clone_args *args, size_t size) {
   return syscall(SYS_clone3, args, size);
+}
+
+void parent_signal_handler(int sig) {
+  if (child_pid > 0) {
+    std::cerr << "cgexec forwarding signal " << sig << " to child " << child_pid
+              << std::endl;
+    kill(child_pid, sig);
+  }
 }
 
 bool execute_with_clone_into_cgroup(int cgroup_fd,
@@ -27,13 +38,13 @@ bool execute_with_clone_into_cgroup(int cgroup_fd,
       .cgroup = static_cast<__u64>(cgroup_fd), // File descriptor of the cgroup
   };
 
-  pid_t pid = clone3(&args, sizeof(args));
-  if (pid == -1) {
+  child_pid = clone3(&args, sizeof(args));
+  if (child_pid == -1) {
     perror("clone3 failed");
     return false;
   }
 
-  if (pid == 0) { // Child process
+  if (child_pid == 0) { // Child process
     // Prepare arguments for execvp
     std::vector<char *> argv;
     for (const auto &arg : command) {
@@ -47,8 +58,17 @@ bool execute_with_clone_into_cgroup(int cgroup_fd,
     perror("execvp failed");
     _exit(EXIT_FAILURE);
   } else { // Parent process
+    // Set up signal forwarding
+    struct sigaction sa{};
+		sa.sa_handler = parent_signal_handler;
+		sa.sa_flags = SA_RESTART;
+    for (int sig = 1; sig < NSIG; ++sig) {
+      if (sig == SIGCHLD || sig == SIGKILL || sig == SIGSTOP)
+        continue;
+      sigaction(sig, &sa, NULL);
+    }
     int status;
-    waitpid(pid, &status, 0);
+    waitpid(child_pid, &status, 0);
     return WIFEXITED(status) && (WEXITSTATUS(status) == 0);
   }
 }
